@@ -27,6 +27,8 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import socket
+
 import requests
 from dotenv import load_dotenv
 
@@ -1219,6 +1221,14 @@ def main() -> None:
 
     if not BOT_TOKEN:
         sys.exit("TELEGRAM_BOT_TOKEN is not set (see .env.example)")
+
+    if not args.once:
+        # Two copies would fight over Telegram updates and double every alert, so allow only one.
+        lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            lock.bind(("127.0.0.1", int(os.getenv("LOCK_PORT", "47653"))))
+        except OSError:
+            sys.exit("The bot is already running in another window.")
 
     try:
         me = tg("getMe")["result"]
