@@ -12,6 +12,7 @@ Modes:
     python bot.py --dump      # single check, prints result and saves raw data to ./debug (no Telegram)
     python bot.py --find-api  # opens the booking page and lists the API requests that mention the trainer
     python bot.py --probe     # replays the site's booking server action for the coming days (debugging)
+    python bot.py --record    # opens a visible browser and records a manual guest booking (debugging)
 """
 
 import argparse
@@ -666,6 +667,88 @@ def probe() -> None:
     print(f"\nRaw responses saved in {DEBUG_DIR.resolve()}")
 
 
+# --------------------------------------------------------------------------- booking flow recorder
+
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+_PHONE_RE = re.compile(r"(?:\+|00)?(?:966|0)[\s-]?5\d(?:[\s-]?\d){7}(?!\d)")
+
+
+def _redact(text: str) -> str:
+    return _PHONE_RE.sub("[phone]", _EMAIL_RE.sub("[email]", text))
+
+
+def record_booking() -> None:
+    """Open a visible browser on the booking page and record every request while the user books by hand.
+
+    Used to learn the guest booking flow so it can be automated. Emails and phone numbers are redacted
+    in the saved log; the user stops before paying and closes the window to finish.
+    """
+    from playwright.sync_api import sync_playwright
+
+    events = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        context = browser.new_context(locale="ar-SA", viewport={"width": 1280, "height": 900})
+
+        def on_response(resp):
+            req = resp.request
+            if req.resource_type not in {"document", "fetch", "xhr"} or "sentry" in resp.url:
+                return
+            try:
+                body = resp.text()
+            except Exception:
+                body = ""
+            events.append({
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "method": req.method,
+                "url": _redact(resp.url),
+                "type": req.resource_type,
+                "status": resp.status,
+                "next_action": req.headers.get("next-action", ""),
+                "request_body": _redact(req.post_data or ""),
+                "response": _redact(body[:3000]),
+            })
+
+        def on_page(pg):
+            pg.on("framenavigated", lambda f: f == pg.main_frame and events.append(
+                {"time": datetime.now().strftime("%H:%M:%S"), "navigated_to": _redact(f.url)}))
+
+        context.on("response", on_response)
+        context.on("page", on_page)
+        page = context.new_page()
+        page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+
+        print("A browser window is open. Book a session as a guest the normal way, and STOP at the payment page")
+        print("(do not pay). Then close the browser window to finish recording.")
+        while any(not pg.is_closed() for pg in context.pages):
+            try:
+                context.pages[0].wait_for_timeout(500)
+            except Exception:
+                break
+        try:
+            browser.close()
+        except Exception:
+            pass
+
+    DEBUG_DIR.mkdir(exist_ok=True)
+    out = DEBUG_DIR / "booking_flow.json"
+    out.write_text(json.dumps(events, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"\nRecorded {len(events)} events. Summary of navigations and data requests:\n")
+    for e in events:
+        if "navigated_to" in e:
+            print(f"{e['time']} → page: {e['navigated_to']}")
+        elif e["method"] == "POST" or e["next_action"]:
+            print(f"{e['time']} {e['method']} {e['status']} {e['url']}")
+            if e["next_action"]:
+                print(f"    next-action: {e['next_action']}")
+            if e["request_body"]:
+                print(f"    body: {e['request_body'][:500]}")
+            if e["response"]:
+                print(f"    response: {e['response'][:400]}")
+    print(f"\nFull log saved to {out.resolve()} (emails and phone numbers are hidden).")
+
+
 # --------------------------------------------------------------------------- state + telegram
 
 
@@ -810,7 +893,12 @@ def main() -> None:
     parser.add_argument("--dump", action="store_true", help="save debug files to ./debug and print results")
     parser.add_argument("--find-api", action="store_true", help="list the page's API requests that mention the trainer")
     parser.add_argument("--probe", action="store_true", help="replay the booking server action for the coming days")
+    parser.add_argument("--record", action="store_true", help="record the requests of a manual guest booking")
     args = parser.parse_args()
+
+    if args.record:
+        record_booking()
+        return
 
     if args.probe:
         probe()
