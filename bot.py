@@ -2,10 +2,15 @@
 Telegram bot that watches the Net Academy booking page and alerts you when
 new sessions appear for a given trainer (default: محمد الداعج).
 
+Two ways to read the sessions:
+    * API mode (recommended): set API_URL to the site's own data endpoint; plain HTTP, fast and exact.
+    * Browser mode: fallback that renders the page with headless Chromium and searches it.
+
 Modes:
-    python bot.py            # long-running: checks periodically + answers /start, /check, /status
-    python bot.py --once     # single check then exit (for cron / GitHub Actions)
-    python bot.py --dump     # single check, saves screenshot/HTML/JSON to ./debug (no Telegram)
+    python bot.py             # long-running: checks periodically + answers /start, /check, /status
+    python bot.py --once      # single check then exit (for cron / GitHub Actions)
+    python bot.py --dump      # single check, prints result and saves raw data to ./debug (no Telegram)
+    python bot.py --find-api  # opens the booking page and lists the API requests that mention the trainer
 """
 
 import argparse
@@ -16,12 +21,11 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright
 
 load_dotenv()
 
@@ -35,6 +39,15 @@ TRAINER_LABEL = os.getenv("TRAINER_LABEL", "محمد الداعج")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
 CLICK_TRAINER = os.getenv("CLICK_TRAINER", "1") == "1"
 PAGE_TIMEOUT_MS = int(os.getenv("PAGE_TIMEOUT_MS", "45000"))
+
+# API mode. API_URL / API_BODY may contain {date}; it is filled with each day from today to today+DAYS_AHEAD.
+API_URL = os.getenv("API_URL", "").strip()
+API_METHOD = os.getenv("API_METHOD", "GET").upper()
+API_HEADERS = json.loads(os.getenv("API_HEADERS") or "{}")
+API_BODY = os.getenv("API_BODY", "")
+DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "14"))
+BROWSER_FALLBACK = os.getenv("BROWSER_FALLBACK", "1") == "1"
+
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
 DEBUG_DIR = Path("debug")
 FAILURE_ALERT_AFTER = 3
@@ -204,6 +217,8 @@ def extract_slots_from_dom(blocks: list[str]) -> tuple[list[str], bool]:
 
 
 def check_page(dump: bool = False) -> dict:
+    from playwright.sync_api import sync_playwright
+
     json_payloads: list[tuple[str, object]] = []
 
     with sync_playwright() as p:
@@ -274,6 +289,118 @@ def check_page(dump: bool = False) -> dict:
     }
 
 
+# --------------------------------------------------------------------------- API check
+
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "ar-SA,ar;q=0.9,en;q=0.8",
+    "Referer": TARGET_URL,
+}
+
+
+def _api_requests() -> list[tuple[str, str]]:
+    """(url, body) pairs to fetch; one per day when {date} is used, otherwise just one."""
+    if "{date}" not in API_URL and "{date}" not in API_BODY:
+        return [(API_URL, API_BODY)]
+    days = [(date.today() + timedelta(days=i)).isoformat() for i in range(DAYS_AHEAD + 1)]
+    return [(API_URL.replace("{date}", d), API_BODY.replace("{date}", d)) for d in days]
+
+
+def check_api(dump: bool = False) -> dict:
+    headers = {**DEFAULT_HEADERS, **API_HEADERS}
+    session = requests.Session()
+    payloads, slots = [], set()
+    for url, body in _api_requests():
+        resp = session.request(API_METHOD, url, headers=headers, data=body.encode("utf-8") if body else None, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        payloads.append({"url": url, "data": data})
+        slots.update(extract_slots_from_json(data))
+
+    if dump:
+        DEBUG_DIR.mkdir(exist_ok=True)
+        (DEBUG_DIR / "api_responses.json").write_text(json.dumps(payloads, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    present = any(_contains_keyword(p["data"]) for p in payloads)
+    return {"slots": sorted(slots), "trainer_present": present, "source": "api-direct", "json_responses": len(payloads)}
+
+
+def check(dump: bool = False) -> dict:
+    if API_URL:
+        try:
+            return check_api(dump)
+        except Exception as e:
+            if not BROWSER_FALLBACK:
+                raise
+            log.warning("API check failed (%s); falling back to the browser", e)
+    return check_page(dump)
+
+
+def find_api() -> None:
+    """Open the booking page, record its JSON requests and show the ones that mention the trainer."""
+    from playwright.sync_api import sync_playwright
+
+    found = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        page = browser.new_page(locale="ar-SA")
+
+        def on_response(resp):
+            try:
+                if "json" in (resp.headers.get("content-type") or ""):
+                    data = resp.json()
+                    req = resp.request
+                    found.append({
+                        "method": req.method,
+                        "url": resp.url,
+                        "body": req.post_data or "",
+                        "mentions_trainer": _contains_keyword(data),
+                        "slots": extract_slots_from_json(data),
+                    })
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+        page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+        try:
+            page.wait_for_load_state("networkidle", timeout=PAGE_TIMEOUT_MS)
+        except Exception:
+            pass
+        page.wait_for_timeout(3000)
+        if CLICK_TRAINER:
+            for kw in TRAINER_KEYWORDS:
+                loc = page.get_by_text(kw, exact=False).first
+                try:
+                    if loc.count() and loc.is_visible():
+                        loc.click(timeout=5000)
+                        page.wait_for_timeout(4000)
+                        break
+                except Exception:
+                    pass
+        browser.close()
+
+    if not found:
+        print("No JSON requests were seen. The page may render its data server-side; use --dump instead.")
+        return
+    print(f"Saw {len(found)} JSON request(s). Ones that mention the trainer are marked with ★\n")
+    for r in sorted(found, key=lambda r: not r["mentions_trainer"]):
+        mark = "★" if r["mentions_trainer"] else " "
+        print(f"{mark} {r['method']} {r['url']}")
+        if r["body"]:
+            print(f"    body: {r['body'][:300]}")
+        if r["slots"]:
+            print(f"    sessions found: {len(r['slots'])}, e.g. {r['slots'][0]}")
+    best = next((r for r in found if r["slots"]), next((r for r in found if r["mentions_trainer"]), None))
+    if best:
+        print("\nSuggested .env lines (replace the date in the URL/body with {date} if it has one):")
+        print(f"API_URL={best['url']}")
+        if best["method"] != "GET":
+            print(f"API_METHOD={best['method']}")
+        if best["body"]:
+            print(f"API_BODY={best['body']}")
+
+
 # --------------------------------------------------------------------------- state + telegram
 
 
@@ -320,7 +447,7 @@ def format_slots(slots: list[str], limit: int = 30) -> str:
 
 def run_check(state: dict, notify: bool = True) -> dict:
     try:
-        result = check_page()
+        result = check()
     except Exception as e:
         state["failures"] = state.get("failures", 0) + 1
         log.error("Check failed (%d in a row): %s", state["failures"], e)
@@ -401,10 +528,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true", help="run a single check and exit")
     parser.add_argument("--dump", action="store_true", help="save debug files to ./debug and print results")
+    parser.add_argument("--find-api", action="store_true", help="list the page's API requests that mention the trainer")
     args = parser.parse_args()
 
+    if args.find_api:
+        find_api()
+        return
+
     if args.dump:
-        result = check_page(dump=True)
+        result = check(dump=True)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         print(f"Debug files written to {DEBUG_DIR.resolve()}")
         return
@@ -419,7 +551,8 @@ def main() -> None:
         res = run_check(state)
         sys.exit(1 if "error" in res else 0)
 
-    log.info("Watching %s for %s every %ss", TARGET_URL, TRAINER_LABEL, CHECK_INTERVAL)
+    log.info("Watching %s for %s every %ss (%s mode)", API_URL or TARGET_URL, TRAINER_LABEL, CHECK_INTERVAL,
+             "API" if API_URL else "browser")
     next_check = 0.0
     while True:
         if time.time() >= next_check:
