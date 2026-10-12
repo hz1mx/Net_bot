@@ -338,28 +338,44 @@ def check(dump: bool = False) -> dict:
 
 
 def find_api() -> None:
-    """Open the booking page, record its JSON requests and show the ones that mention the trainer."""
+    """Open the booking page, record every data request it makes and report which ones mention the trainer.
+
+    Covers plain JSON APIs as well as Next.js data (server-rendered HTML, RSC payloads, server actions).
+    Also saves a screenshot and the visible page text to ./debug.
+    """
     from playwright.sync_api import sync_playwright
 
     found = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        page = browser.new_page(locale="ar-SA")
+        page = browser.new_page(locale="ar-SA", viewport={"width": 1280, "height": 2000})
 
         def on_response(resp):
+            req = resp.request
+            if req.resource_type not in {"document", "fetch", "xhr"} or "sentry" in (req.post_data or ""):
+                return
             try:
-                if "json" in (resp.headers.get("content-type") or ""):
-                    data = resp.json()
-                    req = resp.request
-                    found.append({
-                        "method": req.method,
-                        "url": resp.url,
-                        "body": req.post_data or "",
-                        "mentions_trainer": _contains_keyword(data),
-                        "slots": extract_slots_from_json(data),
-                    })
+                text = resp.text()
             except Exception:
-                pass
+                return
+            ctype = (resp.headers.get("content-type") or "").split(";")[0]
+            slots = []
+            if "json" in ctype:
+                try:
+                    slots = extract_slots_from_json(json.loads(text))
+                except Exception:
+                    pass
+            found.append({
+                "method": req.method,
+                "url": resp.url,
+                "type": req.resource_type,
+                "ctype": ctype,
+                "size": len(text),
+                "body": req.post_data or "",
+                "next_action": req.headers.get("next-action", ""),
+                "mentions_trainer": has_keyword(text),
+                "slots": slots,
+            })
 
         page.on("response", on_response)
         page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
@@ -368,37 +384,43 @@ def find_api() -> None:
         except Exception:
             pass
         page.wait_for_timeout(3000)
-        if CLICK_TRAINER:
+
+        DEBUG_DIR.mkdir(exist_ok=True)
+        page.screenshot(path=str(DEBUG_DIR / "page.png"), full_page=True)
+        page_text = page.inner_text("body")
+        (DEBUG_DIR / "page_text.txt").write_text(page_text, encoding="utf-8")
+        on_page = has_keyword(page_text)
+
+        clicked = False
+        if CLICK_TRAINER and on_page:
             for kw in TRAINER_KEYWORDS:
                 loc = page.get_by_text(kw, exact=False).first
                 try:
                     if loc.count() and loc.is_visible():
                         loc.click(timeout=5000)
                         page.wait_for_timeout(4000)
+                        page.screenshot(path=str(DEBUG_DIR / "after_click.png"), full_page=True)
+                        (DEBUG_DIR / "after_click_text.txt").write_text(page.inner_text("body"), encoding="utf-8")
+                        clicked = True
                         break
                 except Exception:
                     pass
         browser.close()
 
-    if not found:
-        print("No JSON requests were seen. The page may render its data server-side; use --dump instead.")
-        return
-    print(f"Saw {len(found)} JSON request(s). Ones that mention the trainer are marked with ★\n")
+    print(f"Trainer name visible on the page: {'YES' if on_page else 'NO'}" + (" (clicked it)" if clicked else ""))
+    print(f"Saw {len(found)} page/data request(s). Ones whose response mentions the trainer are marked with ★\n")
     for r in sorted(found, key=lambda r: not r["mentions_trainer"]):
         mark = "★" if r["mentions_trainer"] else " "
-        print(f"{mark} {r['method']} {r['url']}")
+        print(f"{mark} {r['method']} [{r['type']}, {r['ctype'] or '?'}, {r['size']} chars] {r['url']}")
+        if r["next_action"]:
+            print(f"    next-action: {r['next_action']}")
         if r["body"]:
             print(f"    body: {r['body'][:300]}")
         if r["slots"]:
             print(f"    sessions found: {len(r['slots'])}, e.g. {r['slots'][0]}")
-    best = next((r for r in found if r["slots"]), next((r for r in found if r["mentions_trainer"]), None))
-    if best:
-        print("\nSuggested .env lines (replace the date in the URL/body with {date} if it has one):")
-        print(f"API_URL={best['url']}")
-        if best["method"] != "GET":
-            print(f"API_METHOD={best['method']}")
-        if best["body"]:
-            print(f"API_BODY={best['body']}")
+    print(f"\nScreenshot and page text saved in {DEBUG_DIR.resolve()}")
+    preview = "\n".join(line for line in page_text.splitlines() if line.strip())[:1500]
+    print("\n----- page text (first 1500 chars) -----\n" + preview)
 
 
 # --------------------------------------------------------------------------- state + telegram
