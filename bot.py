@@ -163,7 +163,7 @@ def extract_slots_from_json(data) -> list[str]:
             if _direct_keyword(node):
                 trainer_ids.update(
                     v for k, v in node.items()
-                    if isinstance(v, str) and len(v) >= 4 and str(k).lower().replace("_", "").endswith("id")
+                    if isinstance(v, str) and len(v) >= 4 and str(k).lower() in {"id", "_id", "uuid"}
                 )
             for v in node.values():
                 collect_ids(v)
@@ -531,10 +531,48 @@ def call_action(action: dict, day: str) -> str:
     return resp.text
 
 
+def _fmt_time(hhmm: str) -> str:
+    h, m = (int(x) for x in hhmm.split(":")[:2])
+    return f"{(h % 12) or 12}:{m:02d} {'ص' if h < 12 else 'م'}"
+
+
+def extract_booking_slots(rows: list) -> list[str] | None:
+    """Read the academy's booking slots: [{booking_date, start_time, end_time, is_available, resource_names}].
+
+    Returns None when the response does not have that shape, so the generic extractor can take over.
+    """
+    slots, recognised = [], False
+
+    def walk(node):
+        nonlocal recognised
+        if isinstance(node, dict):
+            if "resource_names" in node and "start_time" in node:
+                recognised = True
+                names = node.get("resource_names") or []
+                if node.get("is_available", True) and any(has_keyword(str(n)) for n in names):
+                    day = node.get("booking_date", "")
+                    start, end = node.get("start_time", ""), node.get("end_time", "")
+                    try:
+                        when = f"{_fmt_time(start)} – {_fmt_time(end)}" if end else _fmt_time(start)
+                    except ValueError:
+                        when = f"{start} – {end}"
+                    label = f"{_weekday_ar(day)} {day}" if day else ""
+                    slots.append(f"{label} • {when}".strip(" •"))
+                return
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(rows)
+    return slots if recognised else None
+
+
 def check_action(dump: bool = False) -> dict:
     """Ask the site's booking server action for each of the coming days and collect the trainer's times."""
     action, refreshed = load_action(), False
-    slots, present_days = set(), []
+    slots, present_days = [], []  # in date/time order
     for i in range(DAYS_AHEAD + 1):
         day = (today() + timedelta(days=i)).isoformat()
         try:
@@ -551,15 +589,23 @@ def check_action(dump: bool = False) -> dict:
             (DEBUG_DIR / f"day-{day}.txt").write_text(text, encoding="utf-8")
         if not has_keyword(text):
             continue
+        rows = parse_rsc(text)
+        day_slots = extract_booking_slots(rows)
+        if day_slots is not None:
+            # Known response shape: trust it, including "no free times for this coach".
+            slots.extend(day_slots)
+            if day_slots:
+                present_days.append(day)
+            continue
         present_days.append(day)
-        day_slots = extract_slots_from_json(parse_rsc(text))
+        day_slots = extract_slots_from_json(rows)
         if day_slots:
-            slots.update(s if day in s else f"{day} | {s}" for s in day_slots)
+            slots.extend(s if day in s else f"{day} | {s}" for s in day_slots)
         else:
-            # The coach is listed for this day (the site only lists coaches with free times) but the
-            # times could not be matched to them, so report the day itself.
-            slots.add(f"{day} ({_weekday_ar(day)}): فيه حصص متاحة")
-    return {"slots": sorted(slots), "trainer_present": bool(present_days), "source": "server-action",
+            # Unknown shape: the coach is mentioned for this day but the times could not be
+            # matched to them, so report the day itself.
+            slots.append(f"{day} ({_weekday_ar(day)}): فيه حصص متاحة")
+    return {"slots": list(dict.fromkeys(slots)), "trainer_present": bool(present_days), "source": "server-action",
             "json_responses": DAYS_AHEAD + 1}
 
 
