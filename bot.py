@@ -661,10 +661,25 @@ def fingerprint(slot: str) -> str:
     return hashlib.sha1(slot.encode("utf-8")).hexdigest()[:16]
 
 
+class TelegramError(Exception):
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
 def tg(method: str, **params):
-    r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=params, timeout=60)
-    r.raise_for_status()
-    return r.json()
+    # Errors are re-raised without the request URL, because the URL contains the bot token.
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=params, timeout=60)
+    except requests.RequestException as e:
+        raise TelegramError(f"{method}: {str(e).replace(BOT_TOKEN, '***')}") from None
+    try:
+        data = r.json()
+    except ValueError:
+        data = {}
+    if not r.ok or not data.get("ok"):
+        raise TelegramError(f"{method}: HTTP {r.status_code} {data.get('description', '')}".strip(), r.status_code)
+    return data
 
 
 def broadcast(state: dict, text: str) -> None:
@@ -788,6 +803,18 @@ def main() -> None:
 
     if not BOT_TOKEN:
         sys.exit("TELEGRAM_BOT_TOKEN is not set (see .env.example)")
+
+    try:
+        me = tg("getMe")["result"]
+    except TelegramError as e:
+        if e.status in (401, 404):
+            sys.exit(
+                f"Telegram rejected the bot token ({e}).\n"
+                "Check TELEGRAM_BOT_TOKEN in .env: it must be the full token from @BotFather, "
+                "like 123456789:AA..., with no spaces or quotes."
+            )
+        sys.exit(f"Could not reach Telegram: {e}")
+    log.info("Logged in to Telegram as @%s - send it /start", me.get("username"))
 
     state = load_state()
     state.setdefault("chat_ids", [])
