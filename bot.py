@@ -11,6 +11,7 @@ Modes:
     python bot.py --once      # single check then exit (for cron / GitHub Actions)
     python bot.py --dump      # single check, prints result and saves raw data to ./debug (no Telegram)
     python bot.py --find-api  # opens the booking page and lists the API requests that mention the trainer
+    python bot.py --probe     # replays the site's booking server action for the coming days (debugging)
 """
 
 import argparse
@@ -423,6 +424,112 @@ def find_api() -> None:
     print("\n----- page text (first 1500 chars) -----\n" + preview)
 
 
+# --------------------------------------------------------------------------- Next.js server action
+
+ACTION_FILE = Path(os.getenv("ACTION_FILE", "action.json"))
+DATE_ARG_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+RSC_LINE_RE = re.compile(r"^([0-9a-f]+):(.*)$")
+STAFF_RE = re.compile(r"(?:المدرب|المدربة|الكابتن|كابتن|Coach)[^\"\\\n]{1,60}")
+
+
+def discover_action() -> dict:
+    """Load the booking page in a browser and record the server action it calls to fetch a day's times."""
+    from playwright.sync_api import sync_playwright
+
+    captured = {}
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        page = browser.new_page(locale="ar-SA")
+
+        def on_request(req):
+            action_id = req.headers.get("next-action")
+            if not action_id or captured:
+                return
+            try:
+                args = json.loads(req.post_data or "")
+            except Exception:
+                return
+            if isinstance(args, list) and any(isinstance(a, str) and DATE_ARG_RE.match(a) for a in args):
+                keep = {"next-action", "next-router-state-tree", "content-type", "accept"}
+                captured.update({
+                    "url": req.url,
+                    "headers": {k: v for k, v in req.headers.items() if k.lower() in keep},
+                    "args": args,
+                })
+
+        page.on("request", on_request)
+        page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+        try:
+            page.wait_for_load_state("networkidle", timeout=PAGE_TIMEOUT_MS)
+        except Exception:
+            pass
+        page.wait_for_timeout(2000)
+        browser.close()
+
+    if not captured:
+        raise RuntimeError("Could not find the booking server action on the page")
+    ACTION_FILE.write_text(json.dumps(captured, ensure_ascii=False, indent=2), encoding="utf-8")
+    return captured
+
+
+def load_action(refresh: bool = False) -> dict:
+    if not refresh and ACTION_FILE.exists():
+        return json.loads(ACTION_FILE.read_text(encoding="utf-8"))
+    return discover_action()
+
+
+def parse_rsc(text: str) -> list:
+    """Split a React Server Components response into its JSON rows."""
+    rows = []
+    for line in text.splitlines():
+        m = RSC_LINE_RE.match(line)
+        if not m:
+            continue
+        try:
+            rows.append(json.loads(m.group(2)))
+        except Exception:
+            pass
+    return rows
+
+
+def call_action(action: dict, day: str) -> str:
+    args = [day if isinstance(a, str) and DATE_ARG_RE.match(a) else a for a in action["args"]]
+    headers = {**DEFAULT_HEADERS, **action["headers"], "Origin": "https://netacademy.sa"}
+    headers.setdefault("content-type", "text/plain;charset=UTF-8")
+    headers["accept"] = "text/x-component"
+    resp = requests.post(action["url"], headers=headers, data=json.dumps(args, ensure_ascii=False).encode("utf-8"), timeout=30)
+    resp.raise_for_status()
+    if "x-component" not in resp.headers.get("content-type", ""):
+        raise RuntimeError(f"Unexpected response type {resp.headers.get('content-type')}")
+    resp.encoding = "utf-8"  # RSC is always UTF-8; requests would otherwise guess Latin-1
+    return resp.text
+
+
+def probe() -> None:
+    """Replay the booking server action for the coming days and save the raw responses for inspection."""
+    action = load_action(refresh=True)
+    print(f"Server action found: {action['headers'].get('next-action')}\nargs: {json.dumps(action['args'], ensure_ascii=False)}\n")
+    DEBUG_DIR.mkdir(exist_ok=True)
+    sample_shown = False
+    for i in range(DAYS_AHEAD + 1):
+        day = (date.today() + timedelta(days=i)).isoformat()
+        try:
+            text = call_action(action, day)
+        except Exception as e:
+            print(f"{day}: FAILED {e}")
+            continue
+        (DEBUG_DIR / f"day-{day}.txt").write_text(text, encoding="utf-8")
+        staff = sorted({s.strip() for s in STAFF_RE.findall(text)})
+        mark = "★" if has_keyword(text) else " "
+        print(f"{mark} {day}: {len(text)} chars, {len(parse_rsc(text))} rows, staff: {', '.join(staff) or '-'}")
+        if not sample_shown and staff:
+            sample_shown = True
+            sample = text
+    if sample_shown:
+        print(f"\n----- raw response sample (first 2500 chars) -----\n{sample[:2500]}")
+    print(f"\nRaw responses saved in {DEBUG_DIR.resolve()}")
+
+
 # --------------------------------------------------------------------------- state + telegram
 
 
@@ -551,7 +658,12 @@ def main() -> None:
     parser.add_argument("--once", action="store_true", help="run a single check and exit")
     parser.add_argument("--dump", action="store_true", help="save debug files to ./debug and print results")
     parser.add_argument("--find-api", action="store_true", help="list the page's API requests that mention the trainer")
+    parser.add_argument("--probe", action="store_true", help="replay the booking server action for the coming days")
     args = parser.parse_args()
+
+    if args.probe:
+        probe()
+        return
 
     if args.find_api:
         find_api()

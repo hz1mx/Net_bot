@@ -3,3 +3,4 @@ state.json
 debug/
 __pycache__/
 .venv/
+action.json
