@@ -4,3 +4,4 @@ debug/
 __pycache__/
 .venv/
 action.json
+booking_template.json

@@ -12,7 +12,8 @@ Modes:
     python bot.py --dump      # single check, prints result and saves raw data to ./debug (no Telegram)
     python bot.py --find-api  # opens the booking page and lists the API requests that mention the trainer
     python bot.py --probe     # replays the site's booking server action for the coming days (debugging)
-    python bot.py --record    # opens a visible browser and records a manual guest booking (debugging)
+    python bot.py --record    # opens a visible browser and records a manual guest booking (teaches the bot to book)
+    python bot.py --test-book # books the first free session for real (asks first) and prints the payment link
 """
 
 import argparse
@@ -573,12 +574,13 @@ def _fmt_time(hhmm: str) -> str:
     return f"{(h % 12) or 12}:{m:02d} {'ص' if h < 12 else 'م'}"
 
 
-def extract_booking_slots(rows: list) -> list[str] | None:
-    """Read the academy's booking slots: [{booking_date, start_time, end_time, is_available, resource_names}].
+def extract_booking_offers(rows: list) -> list[dict] | None:
+    """Read the academy's booking slots: [{booking_date, start_time, end_time, is_available, resource_names, ...}].
 
+    Each free slot with the trainer becomes an offer holding what is needed to book it.
     Returns None when the response does not have that shape, so the generic extractor can take over.
     """
-    slots, recognised = [], False
+    offers, recognised = [], False
 
     def walk(node):
         nonlocal recognised
@@ -587,14 +589,7 @@ def extract_booking_slots(rows: list) -> list[str] | None:
                 recognised = True
                 names = node.get("resource_names") or []
                 if node.get("is_available", True) and any(has_keyword(str(n)) for n in names):
-                    day = node.get("booking_date", "")
-                    start, end = node.get("start_time", ""), node.get("end_time", "")
-                    try:
-                        when = f"{_fmt_time(start)} – {_fmt_time(end)}" if end else _fmt_time(start)
-                    except ValueError:
-                        when = f"{start} – {end}"
-                    label = f"{_weekday_ar(day)} {day}" if day else ""
-                    slots.append(f"{label} • {when}".strip(" •"))
+                    offers.append(_make_offer(node))
                 return
             for v in node.values():
                 walk(v)
@@ -603,13 +598,46 @@ def extract_booking_slots(rows: list) -> list[str] | None:
                 walk(v)
 
     walk(rows)
-    return slots if recognised else None
+    return offers if recognised else None
+
+
+def _make_offer(slot: dict) -> dict:
+    day = slot.get("booking_date", "")
+    start, end = slot.get("start_time", ""), slot.get("end_time", "")
+    try:
+        when = f"{_fmt_time(start)} – {_fmt_time(end)}" if end else _fmt_time(start)
+    except ValueError:
+        when = f"{start} – {end}"
+    label = f"{_weekday_ar(day)} {day}" if day else ""
+
+    trainer = next((r for r in slot.get("available_resources") or [] if has_keyword(str(r.get("name", "")))), {})
+    court_ids = trainer.get("available_court_ids") or slot.get("available_court_ids") or []
+    courts = {c.get("id"): c for c in slot.get("available_courts") or []}
+    court_id = court_ids[0] if court_ids else None
+    return {
+        "label": f"{label} • {when}".strip(" •"),
+        "button": f"{_weekday_ar(day)} {_fmt_time(start)}" if day and start else start,
+        "date": day,
+        "start": start,
+        "end": end,
+        "court_id": court_id,
+        "court_name": (courts.get(court_id) or {}).get("name"),
+        "trainer_id": trainer.get("id"),
+        "trainer_name": trainer.get("name"),
+        "price": trainer.get("final_price", slot.get("final_price")),
+        "is_peak": slot.get("is_peak", False),
+    }
+
+
+def extract_booking_slots(rows: list) -> list[str] | None:
+    offers = extract_booking_offers(rows)
+    return None if offers is None else [o["label"] for o in offers]
 
 
 def check_action(dump: bool = False) -> dict:
     """Ask the site's booking server action for each of the coming days and collect the trainer's times."""
     action, refreshed = load_action(), False
-    slots, present_days = [], []  # in date/time order
+    slots, present_days, offers = [], [], []  # in date/time order
     for i in range(DAYS_AHEAD + 1):
         day = (today() + timedelta(days=i)).isoformat()
         try:
@@ -629,11 +657,12 @@ def check_action(dump: bool = False) -> dict:
         if not has_keyword(text):
             continue
         rows = parse_rsc(text)
-        day_slots = extract_booking_slots(rows)
-        if day_slots is not None:
+        day_offers = extract_booking_offers(rows)
+        if day_offers is not None:
             # Known response shape: trust it, including "no free times for this coach".
-            slots.extend(day_slots)
-            if day_slots:
+            offers.extend(day_offers)
+            slots.extend(o["label"] for o in day_offers)
+            if day_offers:
                 present_days.append(day)
             continue
         present_days.append(day)
@@ -644,8 +673,8 @@ def check_action(dump: bool = False) -> dict:
             # Unknown shape: the coach is mentioned for this day but the times could not be
             # matched to them, so report the day itself.
             slots.append(f"{day} ({_weekday_ar(day)}): فيه حصص متاحة")
-    return {"slots": list(dict.fromkeys(slots)), "trainer_present": bool(present_days), "source": "server-action",
-            "json_responses": DAYS_AHEAD + 1}
+    return {"slots": list(dict.fromkeys(slots)), "offers": offers, "trainer_present": bool(present_days),
+            "source": "server-action", "json_responses": DAYS_AHEAD + 1}
 
 
 _WEEKDAYS_AR = ["الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
@@ -760,6 +789,185 @@ def record_booking() -> None:
             if e["response"]:
                 print(f"    response: {e['response'][:400]}")
     print(f"\nFull log saved to {out.resolve()} (emails and phone numbers are hidden).")
+    tpl = learn_booking_template(events)
+    if tpl:
+        Path(os.getenv("BOOKING_TEMPLATE_FILE", "booking_template.json")).write_text(
+            json.dumps(tpl, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("Booking steps learned and saved to booking_template.json - the Telegram booking buttons are ready.")
+    else:
+        print("Could not find the guest + booking steps. Make sure you reach the payment page.")
+
+
+# --------------------------------------------------------------------------- booking
+
+BOOKING_TEMPLATE_FILE = Path(os.getenv("BOOKING_TEMPLATE_FILE", "booking_template.json"))
+GUEST_NAME = os.getenv("GUEST_NAME", "").strip()
+GUEST_PHONE = os.getenv("GUEST_PHONE", "").strip()
+GUEST_EMAIL = os.getenv("GUEST_EMAIL", "").strip()
+
+
+class BookingError(Exception):
+    pass
+
+
+def _parse_args(body: str):
+    try:
+        args = json.loads(body)
+    except Exception:
+        return None
+    return args if isinstance(args, list) and args and isinstance(args[0], dict) else None
+
+
+def learn_booking_template(events: list) -> dict | None:
+    """Pull the guest sign-up and create-booking server actions out of a --record log."""
+    guest = booking = payment_url = None
+    for e in events:
+        if "navigated_to" in e:
+            if booking and "/payment/" in e["navigated_to"] and not payment_url:
+                payment_url = e["navigated_to"]
+            continue
+        args = _parse_args(e.get("request_body") or "")
+        if not e.get("next_action") or not args:
+            continue
+        if {"phoneNumber", "email"} <= args[0].keys() and "bookingDate" not in args[0]:
+            guest = e
+        elif {"bookingDate", "startTime", "guestUserId"} <= args[0].keys():
+            booking = e
+    if not (guest and booking):
+        return None
+    booking_id = re.search(r'"bookingId":"([^"]+)"', booking.get("response", ""))
+    if payment_url and booking_id:
+        payment_url = payment_url.replace(booking_id.group(1), "{booking_id}")
+    return {
+        "url": booking["url"],
+        "guest_action": guest["next_action"],
+        "guest_args": _parse_args(guest["request_body"]),
+        "booking_action": booking["next_action"],
+        "booking_args": _parse_args(booking["request_body"]),
+        "payment_url": payment_url or "https://netacademy.sa/payment/{booking_id}",
+    }
+
+
+def load_booking_template() -> dict | None:
+    if BOOKING_TEMPLATE_FILE.exists():
+        return json.loads(BOOKING_TEMPLATE_FILE.read_text(encoding="utf-8"))
+    flow = DEBUG_DIR / "booking_flow.json"
+    if flow.exists():
+        tpl = learn_booking_template(json.loads(flow.read_text(encoding="utf-8")))
+        if tpl:
+            BOOKING_TEMPLATE_FILE.write_text(json.dumps(tpl, ensure_ascii=False, indent=2), encoding="utf-8")
+            return tpl
+    return None
+
+
+def _post_action(url: str, action_id: str, args) -> dict:
+    headers = {**DEFAULT_HEADERS, "Origin": "https://netacademy.sa", "next-action": action_id,
+               "content-type": "text/plain;charset=UTF-8", "accept": "text/x-component"}
+    resp = requests.post(url, headers=headers, data=json.dumps(args, ensure_ascii=False).encode("utf-8"), timeout=30)
+    if resp.status_code == 429 or resp.headers.get("x-vercel-mitigated"):
+        raise BookingError("الموقع رفض الطلب مؤقتاً (حماية ضد كثرة الطلبات)")
+    if resp.status_code == 404 or "x-component" not in resp.headers.get("content-type", ""):
+        raise BookingError("الموقع تحدّث وتغيّرت خطوات الحجز. شغّل --record مرة ثانية")
+    resp.raise_for_status()
+    resp.encoding = "utf-8"
+    for row in parse_rsc(resp.text):
+        if isinstance(row, dict) and "success" in row:
+            if not row["success"]:
+                raise BookingError(str(row.get("error") or row.get("message") or row)[:300])
+            return row.get("data") or {}
+    raise BookingError("رد غير متوقع من الموقع")
+
+
+def _replace_values(node, mapping: dict, numbers: dict):
+    if isinstance(node, dict):
+        return {k: _replace_values(v, mapping, numbers) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_replace_values(v, mapping, numbers) for v in node]
+    if isinstance(node, str):
+        return mapping.get(node, node)
+    if isinstance(node, (int, float)) and not isinstance(node, bool):
+        return numbers.get(node, node)
+    return node
+
+
+def _minutes(hhmm: str) -> int:
+    h, m = (int(x) for x in hhmm.split(":")[:2])
+    return h * 60 + m
+
+
+def build_booking_args(tpl: dict, offer: dict, guest_user_id: str) -> list:
+    """Turn the recorded create-booking call into one for `offer`, swapping every recorded value for the new one."""
+    old = tpl["booking_args"][0]
+    meta = old.get("metadata") or {}
+    mapping = {
+        old.get("courtId"): offer["court_id"],
+        old.get("bookingDate"): offer["date"],
+        old.get("startTime"): offer["start"],
+        old.get("endTime"): offer["end"],
+        old.get("guestUserId"): guest_user_id,
+        old.get("customerEmail"): GUEST_EMAIL,
+        old.get("customerPhone"): GUEST_PHONE,
+        old.get("customerName"): GUEST_NAME,
+        meta.get("trainer_id"): offer["trainer_id"],
+        meta.get("court_name"): offer["court_name"],
+        meta.get("trainer_name"): offer["trainer_name"],
+        "[email]": GUEST_EMAIL,
+        "[phone]": GUEST_PHONE,
+    }
+    mapping = {k: v for k, v in mapping.items() if k is not None and v is not None}
+    numbers = {}
+    if isinstance(old.get("totalAmount"), (int, float)) and offer.get("price") is not None:
+        numbers[old["totalAmount"]] = offer["price"]
+    args = _replace_values(tpl["booking_args"], mapping, numbers)
+    new = args[0]
+    new["isPeak"] = bool(offer.get("is_peak"))
+    if "slotDuration" in new and offer["start"] and offer["end"]:
+        new["slotDuration"] = _minutes(offer["end"]) - _minutes(offer["start"])
+    return args
+
+
+def test_book() -> None:
+    """Book the first free session for TRAINER_KEYWORDS for real (after confirmation) and print the payment link."""
+    tpl = load_booking_template()
+    if not tpl:
+        sys.exit("No booking steps yet. Run: py -3.13 bot.py --record")
+    offers = check().get("offers") or []
+    if not offers:
+        sys.exit("No free sessions for this coach right now. To test with another coach first run:\n"
+                 "    set TRAINER_KEYWORDS=Obaid")
+    offer = offers[0]
+    print(f"Session: {offer['label']}  |  {offer['trainer_name']}  |  {offer['court_name']}  |  {offer['price']} SAR")
+    print("Booking request that will be sent:")
+    print(json.dumps(build_booking_args(tpl, offer, "<guest id>"), ensure_ascii=False, indent=2))
+    if input("\nThis creates a REAL unpaid booking with your details. Type yes to continue: ").strip().lower() != "yes":
+        print("Cancelled.")
+        return
+    print("Payment link:", book_offer(offer))
+
+
+def book_offer(offer: dict) -> str:
+    """Book `offer` as a guest and return the payment page link."""
+    tpl = load_booking_template()
+    if not tpl:
+        raise BookingError("ما عندي خطوات الحجز. شغّل: py -3.13 bot.py --record")
+    if not (GUEST_NAME and GUEST_PHONE and GUEST_EMAIL):
+        raise BookingError("عبّ GUEST_NAME و GUEST_PHONE و GUEST_EMAIL في ملف .env")
+    if not (offer.get("court_id") and offer.get("trainer_id")):
+        raise BookingError("ما قدرت أحدد الملعب أو المدرب لهالحصة")
+
+    guest_args = _replace_values(tpl["guest_args"], {}, {})
+    guest_args[0].update({"name": GUEST_NAME, "phoneNumber": GUEST_PHONE, "email": GUEST_EMAIL})
+    guest = _post_action(tpl["url"], tpl["guest_action"], guest_args)
+    user_id = guest.get("userId")
+    if not user_id:
+        raise BookingError("ما قدرت أسجّل الضيف")
+
+    booking = _post_action(tpl["url"], tpl["booking_action"], build_booking_args(tpl, offer, user_id))
+    booking_id = booking.get("bookingId")
+    if not booking_id:
+        raise BookingError("الموقع ما رجّع رقم الحجز")
+    log.info("Booked %s -> %s", offer["label"], booking_id)
+    return tpl["payment_url"].format(booking_id=booking_id)
 
 
 # --------------------------------------------------------------------------- state + telegram
@@ -803,15 +1011,58 @@ def tg(method: str, **params):
     return data
 
 
-def broadcast(state: dict, text: str) -> None:
+def broadcast(state: dict, text: str, reply_markup: dict | None = None) -> None:
     chat_ids = set(ENV_CHAT_IDS) | {str(c) for c in state.get("chat_ids", [])}
     if not chat_ids:
         log.warning("No chat id configured; send /start to the bot or set TELEGRAM_CHAT_ID.")
+    extra = {"reply_markup": reply_markup} if reply_markup else {}
     for chat_id in chat_ids:
         try:
-            tg("sendMessage", chat_id=chat_id, text=text, disable_web_page_preview=True)
+            tg("sendMessage", chat_id=chat_id, text=text, disable_web_page_preview=True, **extra)
         except Exception as e:
             log.error("Telegram send to %s failed: %s", chat_id, e)
+
+
+def is_owner(state: dict, chat_id: str) -> bool:
+    """Only the configured chat (or, without one, the first to /start) may use the bot; bookings use your details."""
+    if ENV_CHAT_IDS:
+        return chat_id in ENV_CHAT_IDS
+    return not state.get("chat_ids") or state["chat_ids"][0] == chat_id
+
+
+def offer_key(offer: dict) -> str:
+    return fingerprint(offer["label"])[:12]
+
+
+def booking_keyboard(offers: list[dict]) -> dict:
+    buttons = [{"text": f"احجز {o['button']}", "callback_data": f"book:{offer_key(o)}"} for o in offers[:20]]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([{"text": "🌐 صفحة الحجز", "url": TARGET_URL}])
+    return {"inline_keyboard": rows}
+
+
+def handle_booking_press(state: dict, chat_id: str, key: str) -> None:
+    done = state.setdefault("bookings", {})
+    if key in done:
+        tg("sendMessage", chat_id=chat_id, text=f"سبق وحجزتها. رابط الدفع:\n{done[key]}",
+           reply_markup={"inline_keyboard": [[{"text": "💳 ادفع الآن", "url": done[key]}]]})
+        return
+    offer = state.get("offers", {}).get(key)
+    if not offer:
+        tg("sendMessage", chat_id=chat_id, text="❌ هالحصة ما عادت متاحة (انحجزت أو انتهى وقتها).")
+        return
+    tg("sendMessage", chat_id=chat_id, text=f"⏳ جاري حجز {offer['label']}…")
+    try:
+        url = book_offer(offer)
+    except Exception as e:
+        log.error("Booking failed: %s", e)
+        tg("sendMessage", chat_id=chat_id, text=f"❌ ما قدرت أحجز: {e}\n\nاحجز يدوياً بسرعة:\n{TARGET_URL}")
+        return
+    done[key] = url
+    save_state(state)
+    tg("sendMessage", chat_id=chat_id, disable_web_page_preview=True,
+       text=f"✅ انحجزت لك {offer['label']}\nكمّل الدفع بسرعة قبل ما تنتهي المهلة:\n{url}",
+       reply_markup={"inline_keyboard": [[{"text": "💳 ادفع الآن", "url": url}]]})
 
 
 def format_slots(slots: list[str], limit: int = 30) -> str:
@@ -841,6 +1092,7 @@ def run_check(state: dict, notify: bool = True) -> dict:
     state["last_check"] = datetime.now().isoformat(timespec="seconds")
     state["last_slots"] = result["slots"]
 
+    state["offers"] = {offer_key(o): o for o in result.get("offers", [])}
     seen = set(state.get("seen", []))
     current = {fingerprint(s): s for s in result["slots"]}
     new = [s for fp, s in current.items() if fp not in seen]
@@ -852,7 +1104,13 @@ def run_check(state: dict, notify: bool = True) -> dict:
             broadcast(state, f"🎾 ظهر اسم المدرب {TRAINER_LABEL} في صفحة الحجز (ما قدرت أحدد الأوقات، افتح الرابط):\n{TARGET_URL}")
 
     if new and notify:
-        broadcast(state, f"🎾 نزلت حصص جديدة للمدرب {TRAINER_LABEL}:\n\n{format_slots(new)}\n\nاحجز الآن:\n{TARGET_URL}")
+        new_offers = [o for o in result.get("offers", []) if o["label"] in new]
+        if new_offers:
+            broadcast(state, f"🎾 نزلت حصص جديدة للمدرب {TRAINER_LABEL}:\n\n{format_slots(new)}\n\n"
+                             "اضغط على الوقت وأحجزه لك، وأرسل لك رابط الدفع:",
+                      reply_markup=booking_keyboard(new_offers))
+        else:
+            broadcast(state, f"🎾 نزلت حصص جديدة للمدرب {TRAINER_LABEL}:\n\n{format_slots(new)}\n\nاحجز الآن:\n{TARGET_URL}")
 
     # Only remember what is currently visible, so a slot that reappears is announced again.
     state["seen"] = list(current.keys())
@@ -871,38 +1129,59 @@ def handle_updates(state: dict, timeout: int) -> None:
 
     for upd in resp.get("result", []):
         state["update_offset"] = upd["update_id"] + 1
-        msg = upd.get("message") or {}
-        chat_id = str((msg.get("chat") or {}).get("id", ""))
-        text = (msg.get("text") or "").strip().split("@")[0]
-        if not chat_id:
-            continue
-
-        if text == "/start":
-            if chat_id not in state["chat_ids"]:
-                state["chat_ids"].append(chat_id)
-            tg("sendMessage", chat_id=chat_id, text=(
-                f"✅ تم الاشتراك. بنبهك أول ما تنزل حصص للمدرب {TRAINER_LABEL}.\n"
-                f"الفحص كل {CHECK_INTERVAL // 60} دقيقة.\n\n"
-                "/check فحص الآن\n/status آخر نتيجة\n/stop إيقاف التنبيهات"
-            ))
-        elif text == "/stop":
-            state["chat_ids"] = [c for c in state["chat_ids"] if c != chat_id]
-            tg("sendMessage", chat_id=chat_id, text="🛑 تم إيقاف التنبيهات لهذه المحادثة.")
-        elif text == "/status":
-            slots = state.get("last_slots", [])
-            body = format_slots(slots) if slots else "لا توجد حصص متاحة حالياً."
-            tg("sendMessage", chat_id=chat_id, text=f"آخر فحص: {state.get('last_check') or '—'}\n\n{body}")
-        elif text == "/check":
-            tg("sendMessage", chat_id=chat_id, text="⏳ جاري الفحص…")
-            res = run_check(state)
-            if "error" in res:
-                reply = f"❌ فشل الفحص: {res['error']}"
-            elif res["slots"]:
-                reply = f"الحصص المتاحة الآن:\n\n{format_slots(res['slots'])}"
-            else:
-                reply = "لا توجد حصص متاحة حالياً."
-            tg("sendMessage", chat_id=chat_id, text=reply)
+        try:
+            handle_update(state, upd)
+        except Exception as e:
+            log.error("Handling update failed: %s", e)
     save_state(state)
+
+
+def handle_update(state: dict, upd: dict) -> None:
+    cb = upd.get("callback_query")
+    if cb:
+        chat_id = str(((cb.get("message") or {}).get("chat") or {}).get("id", ""))
+        tg("answerCallbackQuery", callback_query_id=cb["id"])
+        data = cb.get("data") or ""
+        if data.startswith("book:") and chat_id and is_owner(state, chat_id):
+            handle_booking_press(state, chat_id, data[5:])
+        return
+
+    msg = upd.get("message") or {}
+    chat_id = str((msg.get("chat") or {}).get("id", ""))
+    text = (msg.get("text") or "").strip().split("@")[0]
+    if not chat_id:
+        return
+    if not is_owner(state, chat_id):
+        tg("sendMessage", chat_id=chat_id, text="هذا البوت خاص.")
+        return
+
+    if text == "/start":
+        if chat_id not in state["chat_ids"]:
+            state["chat_ids"].append(chat_id)
+        tg("sendMessage", chat_id=chat_id, text=(
+            f"✅ تم الاشتراك. بنبهك أول ما تنزل حصص للمدرب {TRAINER_LABEL}.\n"
+            f"الفحص كل {CHECK_INTERVAL // 60} دقيقة.\n\n"
+            "/check فحص الآن\n/status آخر نتيجة\n/stop إيقاف التنبيهات"
+        ))
+    elif text == "/stop":
+        state["chat_ids"] = [c for c in state["chat_ids"] if c != chat_id]
+        tg("sendMessage", chat_id=chat_id, text="🛑 تم إيقاف التنبيهات لهذه المحادثة.")
+    elif text == "/status":
+        slots = state.get("last_slots", [])
+        body = format_slots(slots) if slots else "لا توجد حصص متاحة حالياً."
+        tg("sendMessage", chat_id=chat_id, text=f"آخر فحص: {state.get('last_check') or '—'}\n\n{body}")
+    elif text == "/check":
+        tg("sendMessage", chat_id=chat_id, text="⏳ جاري الفحص…")
+        res = run_check(state)
+        if "error" in res:
+            reply = f"❌ فشل الفحص: {res['error']}"
+        elif res["slots"]:
+            reply = f"الحصص المتاحة الآن:\n\n{format_slots(res['slots'])}"
+        else:
+            reply = "لا توجد حصص متاحة حالياً."
+        offers = res.get("offers") or []
+        extra = {"reply_markup": booking_keyboard(offers)} if offers else {}
+        tg("sendMessage", chat_id=chat_id, text=reply, **extra)
 
 
 def main() -> None:
@@ -912,7 +1191,12 @@ def main() -> None:
     parser.add_argument("--find-api", action="store_true", help="list the page's API requests that mention the trainer")
     parser.add_argument("--probe", action="store_true", help="replay the booking server action for the coming days")
     parser.add_argument("--record", action="store_true", help="record the requests of a manual guest booking")
+    parser.add_argument("--test-book", action="store_true", help="book the first free session for real, to test")
     args = parser.parse_args()
+
+    if args.test_book:
+        test_book()
+        return
 
     if args.record:
         record_booking()
