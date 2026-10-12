@@ -378,11 +378,20 @@ def check_api(dump: bool = False) -> dict:
     return {"slots": sorted(slots), "trainer_present": present, "source": "api-direct", "json_responses": len(payloads)}
 
 
+class SiteBlocked(Exception):
+    """The site's Vercel firewall answered with a rate limit or security checkpoint."""
+
+
+RATE_LIMIT_BACKOFF = int(os.getenv("RATE_LIMIT_BACKOFF", "60"))
+
+
 def check(dump: bool = False) -> dict:
     direct = check_api if API_URL else check_action if USE_SERVER_ACTION else None
     if direct:
         try:
             return direct(dump)
+        except SiteBlocked:
+            raise  # retrying through a browser would only hit the same checkpoint harder
         except Exception as e:
             if not BROWSER_FALLBACK:
                 raise
@@ -550,6 +559,8 @@ def call_action(action: dict, day: str) -> str:
     headers.setdefault("content-type", "text/plain;charset=UTF-8")
     headers["accept"] = "text/x-component"
     resp = requests.post(action["url"], headers=headers, data=json.dumps(args, ensure_ascii=False).encode("utf-8"), timeout=30)
+    if resp.status_code == 429 or resp.headers.get("x-vercel-mitigated"):
+        raise SiteBlocked(f"HTTP {resp.status_code} ({resp.headers.get('x-vercel-mitigated') or 'rate limited'})")
     resp.raise_for_status()
     if "x-component" not in resp.headers.get("content-type", ""):
         raise RuntimeError(f"Unexpected response type {resp.headers.get('content-type')}")
@@ -603,6 +614,8 @@ def check_action(dump: bool = False) -> dict:
         day = (today() + timedelta(days=i)).isoformat()
         try:
             text = call_action(action, day)
+        except SiteBlocked:
+            raise
         except Exception as e:
             if refreshed:
                 raise
@@ -813,11 +826,16 @@ def run_check(state: dict, notify: bool = True) -> dict:
         result = check()
     except Exception as e:
         state["failures"] = state.get("failures", 0) + 1
+        blocked = isinstance(e, SiteBlocked)
         log.error("Check failed (%d in a row): %s", state["failures"], e)
         if notify and state["failures"] == FAILURE_ALERT_AFTER:
-            broadcast(state, f"⚠️ فشل فتح صفحة الحجز {FAILURE_ALERT_AFTER} مرات متتالية.\n{e}")
+            if blocked:
+                broadcast(state, "⚠️ موقع الأكاديمية قاعد يرفض الفحص مؤقتاً (حماية ضد كثرة الطلبات). "
+                                 "البوت بيبطّئ ويحاول مرة ثانية، بس افتح الموقع بنفسك احتياط.")
+            else:
+                broadcast(state, f"⚠️ فشل فتح صفحة الحجز {FAILURE_ALERT_AFTER} مرات متتالية.\n{e}")
         save_state(state)
-        return {"error": str(e)}
+        return {"error": str(e), "blocked": blocked}
 
     state["failures"] = 0
     state["last_check"] = datetime.now().isoformat(timespec="seconds")
@@ -942,8 +960,10 @@ def main() -> None:
     next_check = 0.0
     while True:
         if time.time() >= next_check:
-            run_check(state)
-            next_check = time.time() + current_interval()
+            res = run_check(state)
+            # Back off when the site's firewall pushes back, instead of hammering it.
+            wait = max(current_interval(), RATE_LIMIT_BACKOFF) if res.get("blocked") else current_interval()
+            next_check = time.time() + wait
         handle_updates(state, timeout=int(max(1, min(30, next_check - time.time()))))
 
 
