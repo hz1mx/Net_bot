@@ -1012,7 +1012,8 @@ def tg(method: str, **params):
 
 
 def broadcast(state: dict, text: str, reply_markup: dict | None = None) -> None:
-    chat_ids = set(ENV_CHAT_IDS) | {str(c) for c in state.get("chat_ids", [])}
+    # Alerts go to the owner only (TELEGRAM_CHAT_ID, or the first chat that sent /start).
+    chat_ids = set(ENV_CHAT_IDS) if ENV_CHAT_IDS else {str(c) for c in state.get("chat_ids", [])[:1]}
     if not chat_ids:
         log.warning("No chat id configured; send /start to the bot or set TELEGRAM_CHAT_ID.")
     extra = {"reply_markup": reply_markup} if reply_markup else {}
