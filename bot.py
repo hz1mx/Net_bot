@@ -22,7 +22,7 @@ import os
 import re
 import sys
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -33,7 +33,7 @@ load_dotenv()
 TARGET_URL = os.getenv("TARGET_URL", "https://netacademy.sa/book?activity=tennis&type=trainer")
 TRAINER_KEYWORDS = [
     k.strip()
-    for k in os.getenv("TRAINER_KEYWORDS", "الداعج,داعج,daej,daij,da3j,daaj").split(",")
+    for k in os.getenv("TRAINER_KEYWORDS", "الداعج,داعج,aldaaj,daaj,daej,daij,da3j").split(",")
     if k.strip()
 ]
 TRAINER_LABEL = os.getenv("TRAINER_LABEL", "محمد الداعج")
@@ -48,6 +48,12 @@ API_HEADERS = json.loads(os.getenv("API_HEADERS") or "{}")
 API_BODY = os.getenv("API_BODY", "")
 DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "14"))
 BROWSER_FALLBACK = os.getenv("BROWSER_FALLBACK", "1") == "1"
+USE_SERVER_ACTION = os.getenv("USE_SERVER_ACTION", "1") == "1"
+RIYADH = timezone(timedelta(hours=3))  # Saudi Arabia has no DST
+
+
+def today() -> date:
+    return datetime.now(RIYADH).date()
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
 DEBUG_DIR = Path("debug")
@@ -116,13 +122,13 @@ def _is_unavailable(d: dict) -> bool:
     return False
 
 
-def _contains_keyword(node) -> bool:
+def _contains_keyword(node, trainer_ids: frozenset = frozenset()) -> bool:
     if isinstance(node, str):
-        return has_keyword(node)
+        return node in trainer_ids or has_keyword(node)
     if isinstance(node, dict):
-        return any(_contains_keyword(v) for v in node.values())
+        return any(_contains_keyword(v, trainer_ids) for v in node.values())
     if isinstance(node, list):
-        return any(_contains_keyword(v) for v in node)
+        return any(_contains_keyword(v, trainer_ids) for v in node)
     return False
 
 
@@ -149,10 +155,29 @@ def extract_slots_from_json(data) -> list[str]:
     """
     found: list[dict] = []
 
+    # Slots often point at the coach by id (e.g. "staffIds": [...]) instead of by name.
+    trainer_ids: set[str] = set()
+
+    def collect_ids(node):
+        if isinstance(node, dict):
+            if _direct_keyword(node):
+                trainer_ids.update(
+                    v for k, v in node.items()
+                    if isinstance(v, str) and len(v) >= 4 and str(k).lower().replace("_", "").endswith("id")
+                )
+            for v in node.values():
+                collect_ids(v)
+        elif isinstance(node, list):
+            for v in node:
+                collect_ids(v)
+
+    collect_ids(data)
+    frozen_ids = frozenset(trainer_ids)
+
     def walk(node, owned_by_trainer: bool):
         if isinstance(node, dict):
             owned = owned_by_trainer or _direct_keyword(node)
-            if _looks_like_slot(node) and (owned or _contains_keyword(node)):
+            if _looks_like_slot(node) and (owned or _contains_keyword(node, frozen_ids)):
                 found.append(node)
             for v in node.values():
                 walk(v, owned)
@@ -304,7 +329,7 @@ def _api_requests() -> list[tuple[str, str]]:
     """(url, body) pairs to fetch; one per day when {date} is used, otherwise just one."""
     if "{date}" not in API_URL and "{date}" not in API_BODY:
         return [(API_URL, API_BODY)]
-    days = [(date.today() + timedelta(days=i)).isoformat() for i in range(DAYS_AHEAD + 1)]
+    days = [(today() + timedelta(days=i)).isoformat() for i in range(DAYS_AHEAD + 1)]
     return [(API_URL.replace("{date}", d), API_BODY.replace("{date}", d)) for d in days]
 
 
@@ -328,13 +353,14 @@ def check_api(dump: bool = False) -> dict:
 
 
 def check(dump: bool = False) -> dict:
-    if API_URL:
+    direct = check_api if API_URL else check_action if USE_SERVER_ACTION else None
+    if direct:
         try:
-            return check_api(dump)
+            return direct(dump)
         except Exception as e:
             if not BROWSER_FALLBACK:
                 raise
-            log.warning("API check failed (%s); falling back to the browser", e)
+            log.warning("Direct check failed (%s); falling back to the browser", e)
     return check_page(dump)
 
 
@@ -505,6 +531,45 @@ def call_action(action: dict, day: str) -> str:
     return resp.text
 
 
+def check_action(dump: bool = False) -> dict:
+    """Ask the site's booking server action for each of the coming days and collect the trainer's times."""
+    action, refreshed = load_action(), False
+    slots, present_days = set(), []
+    for i in range(DAYS_AHEAD + 1):
+        day = (today() + timedelta(days=i)).isoformat()
+        try:
+            text = call_action(action, day)
+        except Exception as e:
+            if refreshed:
+                raise
+            # The action id changes whenever the site is redeployed; look it up again once.
+            log.info("Server action call failed (%s); rediscovering it", e)
+            action, refreshed = load_action(refresh=True), True
+            text = call_action(action, day)
+        if dump:
+            DEBUG_DIR.mkdir(exist_ok=True)
+            (DEBUG_DIR / f"day-{day}.txt").write_text(text, encoding="utf-8")
+        if not has_keyword(text):
+            continue
+        present_days.append(day)
+        day_slots = extract_slots_from_json(parse_rsc(text))
+        if day_slots:
+            slots.update(s if day in s else f"{day} | {s}" for s in day_slots)
+        else:
+            # The coach is listed for this day (the site only lists coaches with free times) but the
+            # times could not be matched to them, so report the day itself.
+            slots.add(f"{day} ({_weekday_ar(day)}): فيه حصص متاحة")
+    return {"slots": sorted(slots), "trainer_present": bool(present_days), "source": "server-action",
+            "json_responses": DAYS_AHEAD + 1}
+
+
+_WEEKDAYS_AR = ["الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
+
+
+def _weekday_ar(day: str) -> str:
+    return _WEEKDAYS_AR[date.fromisoformat(day).weekday()]
+
+
 def probe() -> None:
     """Replay the booking server action for the coming days and save the raw responses for inspection."""
     action = load_action(refresh=True)
@@ -512,7 +577,7 @@ def probe() -> None:
     DEBUG_DIR.mkdir(exist_ok=True)
     sample_shown = False
     for i in range(DAYS_AHEAD + 1):
-        day = (date.today() + timedelta(days=i)).isoformat()
+        day = (today() + timedelta(days=i)).isoformat()
         try:
             text = call_action(action, day)
         except Exception as e:
