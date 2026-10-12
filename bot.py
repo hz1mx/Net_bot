@@ -37,7 +37,12 @@ TRAINER_KEYWORDS = [
     if k.strip()
 ]
 TRAINER_LABEL = os.getenv("TRAINER_LABEL", "محمد الداعج")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
+# The academy releases new sessions every night at midnight (Riyadh time); check much more often around then.
+RELEASE_TIME = os.getenv("RELEASE_TIME", "00:00")
+RELEASE_WINDOW_BEFORE_MIN = int(os.getenv("RELEASE_WINDOW_BEFORE_MIN", "2"))
+RELEASE_WINDOW_AFTER_MIN = int(os.getenv("RELEASE_WINDOW_AFTER_MIN", "15"))
+FAST_CHECK_INTERVAL = int(os.getenv("FAST_CHECK_INTERVAL", "10"))
 CLICK_TRAINER = os.getenv("CLICK_TRAINER", "1") == "1"
 PAGE_TIMEOUT_MS = int(os.getenv("PAGE_TIMEOUT_MS", "45000"))
 
@@ -46,7 +51,7 @@ API_URL = os.getenv("API_URL", "").strip()
 API_METHOD = os.getenv("API_METHOD", "GET").upper()
 API_HEADERS = json.loads(os.getenv("API_HEADERS") or "{}")
 API_BODY = os.getenv("API_BODY", "")
-DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "14"))
+DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "3"))
 BROWSER_FALLBACK = os.getenv("BROWSER_FALLBACK", "1") == "1"
 USE_SERVER_ACTION = os.getenv("USE_SERVER_ACTION", "1") == "1"
 RIYADH = timezone(timedelta(hours=3))  # Saudi Arabia has no DST
@@ -54,6 +59,26 @@ RIYADH = timezone(timedelta(hours=3))  # Saudi Arabia has no DST
 
 def today() -> date:
     return datetime.now(RIYADH).date()
+
+
+def in_release_window(now: datetime | None = None) -> bool:
+    now = now or datetime.now(RIYADH)
+    h, m = (int(x) for x in RELEASE_TIME.split(":"))
+    minutes_since_release = (now.hour * 60 + now.minute - (h * 60 + m)) % (24 * 60)
+    return (minutes_since_release < RELEASE_WINDOW_AFTER_MIN
+            or minutes_since_release >= 24 * 60 - RELEASE_WINDOW_BEFORE_MIN)
+
+
+def current_interval() -> int:
+    """Seconds until the next check: short inside the release window, never sleeping past its start."""
+    if in_release_window():
+        return FAST_CHECK_INTERVAL
+    now = datetime.now(RIYADH)
+    h, m = (int(x) for x in RELEASE_TIME.split(":"))
+    window_start = now.replace(hour=h, minute=m, second=0, microsecond=0) - timedelta(minutes=RELEASE_WINDOW_BEFORE_MIN)
+    if window_start <= now:
+        window_start += timedelta(days=1)
+    return max(1, min(CHECK_INTERVAL, int((window_start - now).total_seconds()) + 1))
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
 DEBUG_DIR = Path("debug")
@@ -823,13 +848,14 @@ def main() -> None:
         res = run_check(state)
         sys.exit(1 if "error" in res else 0)
 
-    log.info("Watching %s for %s every %ss (%s mode)", API_URL or TARGET_URL, TRAINER_LABEL, CHECK_INTERVAL,
-             "API" if API_URL else "browser")
+    mode = "custom API" if API_URL else "server action" if USE_SERVER_ACTION else "browser"
+    log.info("Watching %s for %s every %ss, every %ss around %s (%s mode)", TARGET_URL, TRAINER_LABEL,
+             CHECK_INTERVAL, FAST_CHECK_INTERVAL, RELEASE_TIME, mode)
     next_check = 0.0
     while True:
         if time.time() >= next_check:
             run_check(state)
-            next_check = time.time() + CHECK_INTERVAL
+            next_check = time.time() + current_interval()
         handle_updates(state, timeout=int(max(1, min(30, next_check - time.time()))))
 
 
