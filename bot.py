@@ -1028,8 +1028,6 @@ def broadcast(state: dict, text: str, reply_markup: dict | None = None) -> None:
             log.error("Telegram send to %s failed: %s", chat_id, e)
 
 
-BTN_CHECK, BTN_STATUS, BTN_PAUSE, BTN_RESUME = "🔍 فحص الآن", "📋 آخر نتيجة", "⏸ إيقاف التنبيهات", "▶️ تشغيل التنبيهات"
-BUTTONS = {BTN_CHECK: "/check", BTN_STATUS: "/status", BTN_PAUSE: "/stop", BTN_RESUME: "/start"}
 COMMANDS = [
     {"command": "check", "description": "فحص الآن"},
     {"command": "status", "description": "آخر نتيجة"},
@@ -1038,11 +1036,8 @@ COMMANDS = [
 ]
 
 
-def main_keyboard(state: dict) -> dict:
-    """The buttons that stay under the message box."""
-    toggle = BTN_RESUME if state.get("paused") else BTN_PAUSE
-    return {"keyboard": [[{"text": BTN_CHECK}, {"text": BTN_STATUS}], [{"text": toggle}]],
-            "resize_keyboard": True, "is_persistent": True}
+# Commands live in Telegram's menu button (setMyCommands); this clears the old under-the-box keyboard.
+NO_KEYBOARD = {"remove_keyboard": True}
 
 
 def is_owner(state: dict, chat_id: str) -> bool:
@@ -1177,28 +1172,25 @@ def handle_update(state: dict, upd: dict) -> None:
         tg("sendMessage", chat_id=chat_id, text="هذا البوت خاص.")
         return
 
-    if text in BUTTONS:
-        text = BUTTONS[text]
-
     if text == "/start":
         if chat_id not in state["chat_ids"]:
             state["chat_ids"].append(chat_id)
         state["paused"] = False
-        tg("sendMessage", chat_id=chat_id, reply_markup=main_keyboard(state), text=(
+        tg("sendMessage", chat_id=chat_id, reply_markup=NO_KEYBOARD, text=(
             f"✅ التنبيهات شغّالة. بنبهك أول ما تنزل حصص للمدرب {TRAINER_LABEL}، "
             "ومع التنبيه أزرار تحجز فيها بضغطة.\n\n"
             f"الفحص كل {CHECK_INTERVAL // 60} دقيقة، وكل {FAST_CHECK_INTERVAL} ثواني وقت نزول الحصص ({RELEASE_TIME}).\n\n"
-            "استخدم الأزرار تحت 👇"
+            "الأوامر تلقاها في زر القائمة ☰ جنب خانة الكتابة."
         ))
     elif text == "/stop":
         state["paused"] = True
-        tg("sendMessage", chat_id=chat_id, reply_markup=main_keyboard(state),
-           text="⏸ وقّفت التنبيهات. البوت يظل شغّال، واضغط ▶️ لما تبيها ترجع.")
+        tg("sendMessage", chat_id=chat_id, reply_markup=NO_KEYBOARD,
+           text="⏸ وقّفت التنبيهات. البوت يظل شغّال، وأرسل /start لما تبيها ترجع.")
     elif text == "/status":
         slots = state.get("last_slots", [])
         body = format_slots(slots) if slots else "لا توجد حصص متاحة حالياً."
         paused = "\n⏸ التنبيهات موقّفة." if state.get("paused") else ""
-        tg("sendMessage", chat_id=chat_id, reply_markup=main_keyboard(state),
+        tg("sendMessage", chat_id=chat_id, reply_markup=NO_KEYBOARD,
            text=f"آخر فحص: {state.get('last_check') or '—'}{paused}\n\n{body}")
     elif text == "/check":
         tg("sendMessage", chat_id=chat_id, text="⏳ جاري الفحص…")
@@ -1211,9 +1203,9 @@ def handle_update(state: dict, upd: dict) -> None:
             reply = "لا توجد حصص متاحة حالياً."
         offers = res.get("offers") or []
         tg("sendMessage", chat_id=chat_id, text=reply,
-           reply_markup=booking_keyboard(offers) if offers else main_keyboard(state))
+           reply_markup=booking_keyboard(offers) if offers else NO_KEYBOARD)
     else:
-        tg("sendMessage", chat_id=chat_id, text="استخدم الأزرار تحت 👇", reply_markup=main_keyboard(state))
+        tg("sendMessage", chat_id=chat_id, text="الأوامر في زر القائمة ☰ جنب خانة الكتابة.", reply_markup=NO_KEYBOARD)
 
 def main() -> None:
     parser = argparse.ArgumentParser()
