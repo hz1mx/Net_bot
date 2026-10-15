@@ -5,3 +5,4 @@ __pycache__/
 .venv/
 action.json
 booking_template.json
+service_paths.bat
