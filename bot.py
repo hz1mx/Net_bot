@@ -1228,7 +1228,8 @@ def main() -> None:
         try:
             lock.bind(("127.0.0.1", int(os.getenv("LOCK_PORT", "47653"))))
         except OSError:
-            sys.exit("The bot is already running in another window.")
+            print("The bot is already running (in another window or in the background).")
+            sys.exit(3)  # run_bot.bat stops retrying on this code
 
     try:
         me = tg("getMe")["result"]
