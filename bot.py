@@ -1014,6 +1014,8 @@ def tg(method: str, **params):
 
 
 def broadcast(state: dict, text: str, reply_markup: dict | None = None) -> None:
+    if state.get("paused"):
+        return
     # Alerts go to the owner only (TELEGRAM_CHAT_ID, or the first chat that sent /start).
     chat_ids = set(ENV_CHAT_IDS) if ENV_CHAT_IDS else {str(c) for c in state.get("chat_ids", [])[:1]}
     if not chat_ids:
@@ -1024,6 +1026,23 @@ def broadcast(state: dict, text: str, reply_markup: dict | None = None) -> None:
             tg("sendMessage", chat_id=chat_id, text=text, disable_web_page_preview=True, **extra)
         except Exception as e:
             log.error("Telegram send to %s failed: %s", chat_id, e)
+
+
+BTN_CHECK, BTN_STATUS, BTN_PAUSE, BTN_RESUME = "🔍 فحص الآن", "📋 آخر نتيجة", "⏸ إيقاف التنبيهات", "▶️ تشغيل التنبيهات"
+BUTTONS = {BTN_CHECK: "/check", BTN_STATUS: "/status", BTN_PAUSE: "/stop", BTN_RESUME: "/start"}
+COMMANDS = [
+    {"command": "check", "description": "فحص الآن"},
+    {"command": "status", "description": "آخر نتيجة"},
+    {"command": "stop", "description": "إيقاف التنبيهات"},
+    {"command": "start", "description": "تشغيل التنبيهات"},
+]
+
+
+def main_keyboard(state: dict) -> dict:
+    """The buttons that stay under the message box."""
+    toggle = BTN_RESUME if state.get("paused") else BTN_PAUSE
+    return {"keyboard": [[{"text": BTN_CHECK}, {"text": BTN_STATUS}], [{"text": toggle}]],
+            "resize_keyboard": True, "is_persistent": True}
 
 
 def is_owner(state: dict, chat_id: str) -> bool:
@@ -1158,21 +1177,29 @@ def handle_update(state: dict, upd: dict) -> None:
         tg("sendMessage", chat_id=chat_id, text="هذا البوت خاص.")
         return
 
+    if text in BUTTONS:
+        text = BUTTONS[text]
+
     if text == "/start":
         if chat_id not in state["chat_ids"]:
             state["chat_ids"].append(chat_id)
-        tg("sendMessage", chat_id=chat_id, text=(
-            f"✅ تم الاشتراك. بنبهك أول ما تنزل حصص للمدرب {TRAINER_LABEL}.\n"
-            f"الفحص كل {CHECK_INTERVAL // 60} دقيقة.\n\n"
-            "/check فحص الآن\n/status آخر نتيجة\n/stop إيقاف التنبيهات"
+        state["paused"] = False
+        tg("sendMessage", chat_id=chat_id, reply_markup=main_keyboard(state), text=(
+            f"✅ التنبيهات شغّالة. بنبهك أول ما تنزل حصص للمدرب {TRAINER_LABEL}، "
+            "ومع التنبيه أزرار تحجز فيها بضغطة.\n\n"
+            f"الفحص كل {CHECK_INTERVAL // 60} دقيقة، وكل {FAST_CHECK_INTERVAL} ثواني وقت نزول الحصص ({RELEASE_TIME}).\n\n"
+            "استخدم الأزرار تحت 👇"
         ))
     elif text == "/stop":
-        state["chat_ids"] = [c for c in state["chat_ids"] if c != chat_id]
-        tg("sendMessage", chat_id=chat_id, text="🛑 تم إيقاف التنبيهات لهذه المحادثة.")
+        state["paused"] = True
+        tg("sendMessage", chat_id=chat_id, reply_markup=main_keyboard(state),
+           text="⏸ وقّفت التنبيهات. البوت يظل شغّال، واضغط ▶️ لما تبيها ترجع.")
     elif text == "/status":
         slots = state.get("last_slots", [])
         body = format_slots(slots) if slots else "لا توجد حصص متاحة حالياً."
-        tg("sendMessage", chat_id=chat_id, text=f"آخر فحص: {state.get('last_check') or '—'}\n\n{body}")
+        paused = "\n⏸ التنبيهات موقّفة." if state.get("paused") else ""
+        tg("sendMessage", chat_id=chat_id, reply_markup=main_keyboard(state),
+           text=f"آخر فحص: {state.get('last_check') or '—'}{paused}\n\n{body}")
     elif text == "/check":
         tg("sendMessage", chat_id=chat_id, text="⏳ جاري الفحص…")
         res = run_check(state)
@@ -1183,9 +1210,10 @@ def handle_update(state: dict, upd: dict) -> None:
         else:
             reply = "لا توجد حصص متاحة حالياً."
         offers = res.get("offers") or []
-        extra = {"reply_markup": booking_keyboard(offers)} if offers else {}
-        tg("sendMessage", chat_id=chat_id, text=reply, **extra)
-
+        tg("sendMessage", chat_id=chat_id, text=reply,
+           reply_markup=booking_keyboard(offers) if offers else main_keyboard(state))
+    else:
+        tg("sendMessage", chat_id=chat_id, text="استخدم الأزرار تحت 👇", reply_markup=main_keyboard(state))
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -1242,6 +1270,10 @@ def main() -> None:
             )
         sys.exit(f"Could not reach Telegram: {e}")
     log.info("Logged in to Telegram as @%s - send it /start", me.get("username"))
+    try:
+        tg("setMyCommands", commands=COMMANDS)
+    except TelegramError as e:
+        log.warning("Could not set the command menu: %s", e)
 
     state = load_state()
     state.setdefault("chat_ids", [])
