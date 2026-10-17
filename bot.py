@@ -636,10 +636,9 @@ def extract_booking_slots(rows: list) -> list[str] | None:
     return None if offers is None else [o["label"] for o in offers]
 
 
-def check_action(dump: bool = False) -> dict:
-    """Ask the site's booking server action for each of the coming days and collect the trainer's times."""
+def fetch_days():
+    """Yield (day, raw response) from the booking server action for today .. today+DAYS_AHEAD."""
     action, refreshed = load_action(), False
-    slots, present_days, offers = [], [], []  # in date/time order
     for i in range(DAYS_AHEAD + 1):
         day = (today() + timedelta(days=i)).isoformat()
         try:
@@ -653,6 +652,66 @@ def check_action(dump: bool = False) -> dict:
             log.info("Server action call failed (%s); rediscovering it", e)
             action, refreshed = load_action(refresh=True), True
             text = call_action(action, day)
+        yield day, text
+
+
+def _short_coach(name: str) -> str:
+    """'المدرب عبيد / Coach Obaid' -> 'عبيد'."""
+    ar = name.split("/")[0].strip()
+    return re.sub(r"^(المدربة|المدرب|الكابتن|كابتن)\s+", "", ar) or name.strip()
+
+
+def all_sessions_report() -> list[str]:
+    """Every free session for every coach, by day, plus whether the site still answers the way the bot expects."""
+    lines, unknown_days, total = [], [], 0
+    for day, text in fetch_days():
+        rows = parse_rsc(text)
+        slots, recognised = [], False
+
+        def walk(node):
+            nonlocal recognised
+            if isinstance(node, dict):
+                if "resource_names" in node and "start_time" in node:
+                    recognised = True
+                    if node.get("is_available", True):
+                        slots.append(node)
+                    return
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+
+        walk(rows)
+        # An empty day is a short reply with no slots (~190 chars); a long reply the bot cannot read,
+        # or one that is not RSC at all, means the site changed its format.
+        if not recognised and (not rows or len(text) > 400):
+            unknown_days.append(day)
+        lines.append(f"\n📅 {_weekday_ar(day)} {day}")
+        if not slots:
+            lines.append("  ما فيه حصص متاحة")
+            continue
+        for slot in slots:
+            total += 1
+            coaches = "، ".join(_short_coach(str(n)) for n in slot.get("resource_names") or [])
+            mark = "⭐ " if any(has_keyword(str(n)) for n in slot.get("resource_names") or []) else ""
+            try:
+                when = _fmt_time(slot.get("start_time", ""))
+            except ValueError:
+                when = slot.get("start_time", "")
+            lines.append(f"  • {mark}{when} — {coaches}")
+    if unknown_days:
+        head = (f"⚠️ شكل بيانات الموقع تغيّر في: {', '.join(unknown_days)}. "
+                "ممكن البوت ما يلقط الحصص صح، شغّل --probe وأرسل النتيجة.")
+    else:
+        head = f"✅ البوت يقرأ الموقع عادي. عدد الحصص المتاحة لكل المدربين: {total} (⭐ = {TRAINER_LABEL})"
+    return [head] + lines
+
+
+def check_action(dump: bool = False) -> dict:
+    """Ask the site's booking server action for each of the coming days and collect the trainer's times."""
+    slots, present_days, offers = [], [], []  # in date/time order
+    for day, text in fetch_days():
         if dump:
             DEBUG_DIR.mkdir(exist_ok=True)
             (DEBUG_DIR / f"day-{day}.txt").write_text(text, encoding="utf-8")
@@ -1031,6 +1090,7 @@ def broadcast(state: dict, text: str, reply_markup: dict | None = None) -> None:
 COMMANDS = [
     {"command": "check", "description": "فحص الآن"},
     {"command": "status", "description": "آخر نتيجة"},
+    {"command": "all", "description": "كل الحصص لكل المدربين (للتأكد إن البوت شغّال)"},
     {"command": "stop", "description": "إيقاف التنبيهات"},
     {"command": "start", "description": "تشغيل التنبيهات"},
 ]
@@ -1080,6 +1140,19 @@ def handle_booking_press(state: dict, chat_id: str, key: str) -> None:
     tg("sendMessage", chat_id=chat_id, disable_web_page_preview=True,
        text=f"✅ انحجزت لك {offer['label']}\nكمّل الدفع بسرعة قبل ما تنتهي المهلة:\n{url}",
        reply_markup={"inline_keyboard": [[{"text": "💳 ادفع الآن", "url": url}]]})
+
+
+def _chunks(lines: list[str], limit: int = 3800) -> list[str]:
+    """Join lines into messages under Telegram's 4096-character limit."""
+    out, cur = [], ""
+    for line in lines:
+        if cur and len(cur) + len(line) + 1 > limit:
+            out.append(cur)
+            cur = ""
+        cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        out.append(cur)
+    return out
 
 
 def format_slots(slots: list[str], limit: int = 30) -> str:
@@ -1192,6 +1265,14 @@ def handle_update(state: dict, upd: dict) -> None:
         paused = "\n⏸ التنبيهات موقّفة." if state.get("paused") else ""
         tg("sendMessage", chat_id=chat_id, reply_markup=NO_KEYBOARD,
            text=f"آخر فحص: {state.get('last_check') or '—'}{paused}\n\n{body}")
+    elif text == "/all":
+        tg("sendMessage", chat_id=chat_id, text="⏳ أجيب كل الحصص…")
+        try:
+            report = all_sessions_report()
+        except Exception as e:
+            report = [f"❌ ما قدرت أقرأ الموقع: {e}"]
+        for chunk in _chunks(report):
+            tg("sendMessage", chat_id=chat_id, text=chunk, reply_markup=NO_KEYBOARD)
     elif text == "/check":
         tg("sendMessage", chat_id=chat_id, text="⏳ جاري الفحص…")
         res = run_check(state)
