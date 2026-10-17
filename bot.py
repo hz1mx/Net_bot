@@ -91,7 +91,18 @@ FAILURE_ALERT_AFTER = 3
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ENV_CHAT_IDS = [c.strip() for c in os.getenv("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+BOT_FILE = Path(__file__).resolve()
+
+# Log to the console and to bot.log next to the script (the background task has no window to read).
+_log_handlers: list[logging.Handler] = [logging.StreamHandler()]
+try:
+    from logging.handlers import RotatingFileHandler
+
+    _log_handlers.append(RotatingFileHandler(BOT_FILE.with_name("bot.log"), maxBytes=1_000_000,
+                                             backupCount=2, encoding="utf-8"))
+except OSError:
+    pass
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=_log_handlers)
 log = logging.getLogger("net_bot")
 
 TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\b|\b\d{1,2}\s*(?:AM|PM|am|pm)\b|\d{1,2}\s*(?:ص|م)\b")
@@ -1264,7 +1275,7 @@ def handle_update(state: dict, upd: dict) -> None:
         body = format_slots(slots) if slots else "لا توجد حصص متاحة حالياً."
         paused = "\n⏸ التنبيهات موقّفة." if state.get("paused") else ""
         tg("sendMessage", chat_id=chat_id, reply_markup=NO_KEYBOARD,
-           text=f"آخر فحص: {state.get('last_check') or '—'}{paused}\n\n{body}")
+           text=f"آخر فحص: {state.get('last_check') or '—'}{paused}\nنسخة البوت: {bot_version()}\n\n{body}")
     elif text == "/all":
         tg("sendMessage", chat_id=chat_id, text="⏳ أجيب كل الحصص…")
         try:
@@ -1287,6 +1298,70 @@ def handle_update(state: dict, upd: dict) -> None:
            reply_markup=booking_keyboard(offers) if offers else NO_KEYBOARD)
     else:
         tg("sendMessage", chat_id=chat_id, text="الأوامر في زر القائمة ☰ جنب خانة الكتابة.", reply_markup=NO_KEYBOARD)
+
+# --------------------------------------------------------------------------- reload on change
+# When bot.py is replaced on disk (git pull, an edit), the bot exits with EXIT_RELOAD and run_bot.bat
+# starts the new version right away. Once a version has started fine it is kept as bot.py.good;
+# if a new version crashes, run_bot.bat puts bot.py.good back and leaves update_failed.flag.
+EXIT_RELOAD = 4
+GOOD_COPY = BOT_FILE.with_name("bot.py.good")
+UPDATE_FAILED_FLAG = BOT_FILE.with_name("update_failed.flag")
+
+
+def bot_version() -> str:
+    return hashlib.sha1(BOT_FILE.read_bytes()).hexdigest()[:7]
+
+
+class ReloadWatcher:
+    def __init__(self):
+        self.mtime = BOT_FILE.stat().st_mtime
+        self.rejected = None
+
+    def changed_and_valid(self, state: dict) -> bool:
+        try:
+            mtime = BOT_FILE.stat().st_mtime
+        except OSError:
+            return False
+        if mtime == self.mtime or mtime == self.rejected:
+            return False
+        time.sleep(2)  # let the writer finish
+        try:
+            compile(BOT_FILE.read_bytes(), str(BOT_FILE), "exec")
+        except SyntaxError as e:
+            self.rejected = BOT_FILE.stat().st_mtime
+            log.error("New bot.py has a syntax error, keeping the running version: %s", e)
+            broadcast_owner(state, f"⚠️ bot.py الجديد فيه خطأ ({e.msg}، سطر {e.lineno})، "
+                                   "والبوت مكمّل على النسخة الحالية.")
+            return False
+        return True
+
+
+def broadcast_owner(state: dict, text: str) -> None:
+    """Like broadcast, but also while alerts are paused: for messages about the bot itself."""
+    paused = state.pop("paused", None)
+    try:
+        broadcast(state, text)
+    finally:
+        if paused is not None:
+            state["paused"] = paused
+
+
+def after_start(state: dict) -> None:
+    """Report version changes and failed updates, and remember this version as the last good one."""
+    version = bot_version()
+    if UPDATE_FAILED_FLAG.exists():
+        UPDATE_FAILED_FLAG.unlink()
+        broadcast_owner(state, "⚠️ النسخة الجديدة من البوت ما اشتغلت، فرجّعت النسخة اللي قبلها. "
+                               "البوت شغّال عادي، والتفاصيل في bot.log.")
+    elif state.get("version") and state["version"] != version:
+        broadcast_owner(state, f"♻️ تحدّث البوت ورجع يشتغل (نسخة {version}).")
+    state["version"] = version
+    save_state(state)
+    try:
+        GOOD_COPY.write_bytes(BOT_FILE.read_bytes())
+    except OSError as e:
+        log.warning("Could not save bot.py.good: %s", e)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -1355,6 +1430,9 @@ def main() -> None:
         res = run_check(state)
         sys.exit(1 if "error" in res else 0)
 
+    after_start(state)
+    watcher = ReloadWatcher()
+
     mode = "custom API" if API_URL else "server action" if USE_SERVER_ACTION else "browser"
     log.info("Watching %s for %s every %ss, every %ss around %s (%s mode)", TARGET_URL, TRAINER_LABEL,
              CHECK_INTERVAL, FAST_CHECK_INTERVAL, RELEASE_TIME, mode)
@@ -1366,6 +1444,10 @@ def main() -> None:
             wait = max(current_interval(), RATE_LIMIT_BACKOFF) if res.get("blocked") else current_interval()
             next_check = time.time() + wait
         handle_updates(state, timeout=int(max(1, min(30, next_check - time.time()))))
+        if watcher.changed_and_valid(state):
+            log.info("bot.py changed on disk; restarting into the new version")
+            save_state(state)
+            sys.exit(EXIT_RELOAD)
 
 
 if __name__ == "__main__":

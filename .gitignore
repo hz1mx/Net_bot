@@ -6,3 +6,6 @@ __pycache__/
 action.json
 booking_template.json
 service_paths.bat
+bot.log*
+bot.py.good
+update_failed.flag
